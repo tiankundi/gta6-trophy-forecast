@@ -137,12 +137,15 @@ def read_stamp(entry):
     return parse_time(entry.get("slot") or entry["at"])
 
 
-def trophy_volatility(series):
-    """Std-dev of logit moves per sqrt-day over changing adjacent reads.
+def scaled_logit_moves(series):
+    """Logit moves between adjacent reads, each scaled by 1/sqrt(days).
 
-    `series` is a list of (hours_since_first, rate) for one trophy.
-    Moves between equal rates carry no volatility information and are
-    skipped; with fewer than two usable moves the default applies.
+    `series` is a list of (hours_since_first, rate) for one trophy, in
+    time order.  A pair contributes only when the rate actually changed
+    and time actually advanced: Exophase republishes an unchanged page
+    for hours at a stretch, and those flat republishes say nothing about
+    how jumpy the trophy is.  Scaling by the square root of the gap puts
+    a 10-minute move and a 6-hour move on the same per-day footing.
     """
     moves = []
     for (h_prev, r_prev), (h_cur, r_cur) in zip(series, series[1:]):
@@ -153,11 +156,59 @@ def trophy_volatility(series):
             continue
         step = logit_of_percent(r_cur) - logit_of_percent(r_prev)
         moves.append(step / math.sqrt(gap_days))
+    return moves
+
+
+def trophy_volatility(series):
+    """Standard deviation of a trophy's scaled logit moves.
+
+    Fewer than two usable moves cannot pin a spread down, so the
+    contest-wide default takes over for that trophy.
+    """
+    moves = scaled_logit_moves(series)
     if len(moves) < 2:
         return DEFAULT_VOL
     mean = sum(moves) / len(moves)
     var = sum((m - mean) ** 2 for m in moves) / len(moves)
     return math.sqrt(var)
+
+
+def spread_for(vol, horizon_days):
+    """Logit-scale half-width for one trophy at the given horizon.
+
+    A variance floor keeps even a perfectly flat history honestly
+    uncertain (the next Exophase refresh can still move every rate),
+    and the clamp keeps one wild series from blowing the band up.
+    """
+    raw = math.sqrt(SPREAD_FLOOR_VAR + vol * vol * horizon_days)
+    return clamp(raw, SPREAD_MIN, SPREAD_MAX)
+
+
+def rate_from_log_counts(log_count, log_pool):
+    """100 * exp(log_count - log_pool), clamped to the model's range.
+
+    The log difference is clamped first so a steep fitted slope over a
+    long horizon cannot overflow exp() before the rate clamp applies;
+    the bounds are exactly the [0.02, 99.95] rate clamp in log space.
+    """
+    log_ratio = clamp(log_count - log_pool, math.log(0.0002), math.log(0.9995))
+    return clamp(100.0 * math.exp(log_ratio), 0.02, 99.95)
+
+
+def fallback_rate(tier, tier_fallback, global_fallback):
+    """Median last rate for a trophy with no usable series of its own.
+
+    Prefers its own tier's median, then the case-wide median, then a
+    neutral 1%.  The checks are explicit None tests rather than truthy
+    shortcuts: a tier whose median last rate is genuinely 0.0 must be
+    honoured, not skipped over as if the tier had no data at all.
+    """
+    rate = tier_fallback.get(tier)
+    if rate is not None:
+        return rate
+    if global_fallback is not None:
+        return global_fallback
+    return 1.0
 
 
 def forecast_case(case):
@@ -186,11 +237,10 @@ def forecast_case(case):
     if not history:
         rows = []
         for trophy in trophies:
-            med_rate = tier_fallback.get(trophy["tier"]) or global_fallback or 1.0
+            med_rate = fallback_rate(trophy["tier"], tier_fallback, global_fallback)
             centre = logit_of_percent(med_rate)
-            spread = clamp(math.sqrt(SPREAD_FLOOR_VAR + DEFAULT_VOL ** 2 * horizon_days),
-                           SPREAD_MIN, SPREAD_MAX)
-            rows.append({"id": trophy["id"], "q": quantiles(centre, spread)})
+            rows.append({"id": trophy["id"],
+                         "q": quantiles(centre, spread_for(DEFAULT_VOL, horizon_days))})
         return {"trophies": rows}
 
     first_moment = read_stamp(history[0])
@@ -253,16 +303,14 @@ def forecast_case(case):
 
     rows = []
     for idx, trophy in enumerate(trophies):
-        spread = clamp(math.sqrt(SPREAD_FLOOR_VAR + vols[idx] ** 2 * horizon_days),
-                       SPREAD_MIN, SPREAD_MAX)
+        spread = spread_for(vols[idx], horizon_days)
         if not series_by_idx[idx]:
-            med_rate = tier_fallback.get(trophy["tier"]) or global_fallback or 1.0
+            med_rate = fallback_rate(trophy["tier"], tier_fallback, global_fallback)
             centre = logit_of_percent(med_rate)
             rows.append({"id": trophy["id"], "q": quantiles(centre, spread)})
             continue
         log_count_target = intercepts[idx] + slopes[idx] * x_target
-        rate_model = clamp(100.0 * math.exp(log_count_target - log_pool_target),
-                           0.02, 99.95)
+        rate_model = rate_from_log_counts(log_count_target, log_pool_target)
         centre = ((1.0 - PERSIST_WEIGHT) * logit_of_percent(rate_model)
                   + PERSIST_WEIGHT * logit_of_percent(last_rates[idx]))
         rows.append({"id": trophy["id"], "q": quantiles(centre, spread)})
